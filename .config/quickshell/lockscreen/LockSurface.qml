@@ -82,7 +82,7 @@ Rectangle {
         Rectangle {
             id: passwordBox
             Layout.alignment: Qt.AlignHCenter
-            width: 340
+            width: 380
             height: 44
             color: "#1a1a1a"
             radius: 8
