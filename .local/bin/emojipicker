@@ -1,0 +1,25 @@
+#!/bin/sh
+EMOJI_FILE="${XDG_DATA_HOME:-$HOME/.local/share/characters}/emojis"
+[ ! -f "$EMOJI_FILE" ] && notify-send "Emoji picker" "Emoji file not found at $EMOJI_FILE" && exit 1
+chosen=$(cat "$EMOJI_FILE" | rofi -dmenu \
+    -i \
+    -p "Emoji " \
+    -no-show-icons \
+    -theme-str '
+        window {
+            width: 500px;
+            location: center;
+            anchor: center;
+            border-radius: 12px;
+        }
+        mainbox   { padding: 8px 16px; }
+        listview  { lines: 10; scrollbar: false; spacing: 0px; }
+        element   { padding: 4px 0px; }
+        element-text { font: "monospace 14"; }
+    ')
+[ -z "$chosen" ] && exit 0
+# Extract just the emoji character
+emoji=$(echo "$chosen" | awk '{print $1}')
+# Copy to clipboard
+echo -n "$emoji" | wl-copy
+notify-send "$emoji Copied to clipboard!"

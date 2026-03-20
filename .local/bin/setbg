@@ -1,0 +1,28 @@
+#!/bin/bash
+
+WALLPAPERS_DIR="/home/user/wallpapers"
+LAST_WALLPAPER="$HOME/.config/mango/last_wallpaper.txt"
+
+[ -d "$WALLPAPERS_DIR" ] || { echo "Error: Wallpapers directory not found."; exit 1; }
+
+PREVIOUS=$(cat "$LAST_WALLPAPER" 2>/dev/null)
+
+# Pick a random image that isn't the last one
+for _ in $(seq 10); do
+    CANDIDATE=$(find "$WALLPAPERS_DIR" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.gif" -o -iname "*.bmp" -o -iname "*.svg" \) | shuf -n 1)
+    [ "$CANDIDATE" != "$PREVIOUS" ] && { IMAGE="$CANDIDATE"; break; }
+done
+
+[ -z "$IMAGE" ] && { echo "Error: No images found."; exit 1; }
+
+echo "$IMAGE" > "$LAST_WALLPAPER"
+
+killall swaybg 2>/dev/null
+systemd-run --user swaybg -i "$IMAGE" -m stretch
+wal -n -i "$(readlink -f "$IMAGE")" -o "${HOME}/.config/wal/postrun"
+
+pkill waybar
+sleep 0.1
+waybar
+
+mmsg -d reload_config

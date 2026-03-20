@@ -1,0 +1,29 @@
+configuration {
+display-drun: "Applications";
+display-window: "Windows";
+drun-display-format: "{icon} {name}";
+font: "JetBrainsMono Nerd Font Medium 13";
+modi:"drun";
+show-icons: true;
+
+kb-row-up: "Up,Control+k";
+kb-row-left: "Left,Control+h";
+kb-row-right: "Right,Control+l";
+kb-row-down: "Down,Control+j";
+
+kb-accept-entry: "Control+z,Control+y,Return,KP_Enter";
+
+kb-remove-to-eol: "";
+kb-move-char-back: "Control+b";
+kb-remove-char-back: "BackSpace";
+kb-move-char-forward: "Control+f";
+kb-mode-complete: "Control+o";
+}
+
+window {
+   width: 600;
+   height: 450;
+   transparency: "real";
+   }
+
+@import "~/.cache/wal/colors-rofi-dark"

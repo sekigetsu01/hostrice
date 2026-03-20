@@ -1,0 +1,63 @@
+#!/bin/bash
+
+python3 - << 'PYEOF'
+import calendar, re, subprocess
+from datetime import date
+
+today_date = date.today()
+today   = today_date.day
+month   = today_date.month
+year    = today_date.year
+
+cal_text = calendar.TextCalendar(firstweekday=0).formatyear(year, 2, 1, 1, 3)
+lines   = cal_text.splitlines()
+
+row_header_lines = []
+for i, line in enumerate(lines):
+    if sum(1 for m in calendar.month_name[1:] if m in line) >= 2:
+        row_header_lines.append(i)
+
+row = (month - 1) // 3
+col = (month - 1) % 3
+
+block_start = row_header_lines[row]
+block_end   = row_header_lines[row + 1] if row + 1 < len(row_header_lines) else len(lines)
+
+month_col_start = col * 22
+HIGHLIGHT = "#fabd2f"
+
+def span(text, color):
+    return f'<span foreground="{color}"><b>{text}</b></span>'
+
+output = []
+for i, line in enumerate(lines):
+    if block_start + 2 <= i < block_end:
+        padded  = line.ljust(month_col_start + 22)
+        segment = padded[month_col_start : month_col_start + 20]
+        target  = f'{today:2d}'
+        new_seg, n = re.subn(
+            r'(?<!\d)' + re.escape(target) + r'(?!\d)',
+            span(target, HIGHLIGHT), segment, count=1
+        )
+        if n:
+            line = (padded[:month_col_start] + new_seg + padded[month_col_start + 20:]).rstrip()
+
+    output.append(line)
+
+subprocess.run([
+    'rofi', '-dmenu', '-p', '', '-no-show-icons', '-markup-rows',
+    '-theme-str', '''
+        window {
+            width: 640px;
+            height: 760px;
+            location: north;
+            anchor:north;
+            border-radius: 8px;
+        }
+        listview  { lines: 45; scrollbar: false; spacing: 0px; }
+        inputbar  { enabled: false; }
+        element   { padding: 0px; spacing: 0px; }
+        element-text { font: "monospace 11"; line-height: 1.1; }
+    '''
+], input='\n'.join(output), text=True)
+PYEOF

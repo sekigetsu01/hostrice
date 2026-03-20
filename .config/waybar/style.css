@@ -1,0 +1,133 @@
+@import url('../../.cache/wal/colors-waybar.css');
+
+* {
+    font-family: "JetBrainsMono Nerd Font", monospace;
+    font-size: 16px;
+    font-weight: bold;
+
+    border: none;
+    border-radius: 0;
+    min-height: 0;
+}
+
+
+#workspaces {
+    margin: 0 4px;
+}
+
+window#waybar {
+    background-color: @background;
+    color: @foreground;
+}
+
+#workspaces button {
+    padding: 0 9px;
+    color: @color8;
+    background: transparent;
+    border-bottom: 2px solid transparent;
+    transition: all 0.12s ease;
+}
+#workspaces button.active {
+    color: @color4;
+    border-bottom: 2px solid @color4;
+    opacity: 1;
+}
+#workspaces button.hidden {
+    color: @foreground;
+}
+
+button:hover {
+    background: alpha(@foreground, 0.08);
+    color: @foreground;
+}
+
+#clock,
+#custom-sep,
+#battery,
+#pulseaudio,
+#cpu,
+#memory,
+#disk,
+#network,
+#tray {
+    padding: 0 8px;
+}
+
+#custom-sep {
+    color: @color8;
+    opacity: 0.6;
+    font-size: 15px;
+    padding: 0 1px;
+
+}
+
+#clock {
+    padding: 0 14px;
+    color: @color6;
+    border-bottom: 2px solid @color6;
+}
+
+#disk {
+    color: @color5;
+    border-bottom: 2px solid @color5;
+}
+
+#memory {
+    color: @color3;
+    border-bottom: 2px solid @color3;
+}
+
+#cpu {
+    color: @color2;
+    border-bottom: 2px solid @color2;
+
+}
+
+#pulseaudio {
+    color: @color4;
+    border-bottom: 2px solid @color4;
+}
+
+#pulseaudio.muted {
+    color: @color8;
+    border-bottom: 2px solid @color8;
+    opacity: 0.5;
+}
+
+#network {
+    color: @color5;
+    border-bottom: 2px solid @color5;
+}
+
+
+#battery{
+    padding: 0px 5px;
+    transition: all .3s ease;
+    color:@color11;
+    border-bottom: 2px solid @color11;
+
+
+}
+#battery.charging {
+    color: #26A65B;
+    border-bottom: 2px solid #26A65B;
+}
+
+#battery.warning:not(.charging) {
+    color: #ffbe61;
+    border-bottom: 2px solid #ffbe61;
+}
+
+#battery.critical:not(.charging) {
+    color: #f53c3c;
+    border-bottom: 2px solid #f53c3c;
+    animation-name: blink;
+    animation-duration: 0.5s;
+    animation-timing-function: linear;
+    animation-iteration-count: infinite;
+    animation-direction: alternate;
+}
+
+#tray {
+    background-color: @color1;
+}

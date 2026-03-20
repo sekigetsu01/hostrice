@@ -1,0 +1,104 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 22,
+  "spacing": 4,
+  "modules-left": [
+    "ext/workspaces",
+    "custom/sep",
+    "dwl/window"
+  ],
+  "modules-right": [
+    "custom/sep",
+    "cpu",
+    "custom/sep",
+    "memory",
+    "custom/sep",
+    "disk",
+    "custom/sep",
+    "pulseaudio",
+    "custom/sep",
+    "network",
+    "custom/sep",
+    "battery",
+    "custom/sep",
+    "clock",
+    "custom/sep",
+    "tray"
+  ],
+  "clock": {
+    "format": " {:%H:%M}",
+    "format-alt": "{:%a %d %b %y}",
+    "on-click-right": "~/.local/bin/calendar"
+  },
+  "cpu": {
+    "format": "CPU: {usage}%",
+    "tooltip": false,
+    "on-click": "foot -e btop"
+  },
+  "memory": {
+    "format": "Mem: {used}GiB",
+    "on-click": "foot -e btop"
+  },
+  "disk": {
+    "interval": 60,
+    "path": "/",
+    "format": "Disk: {free}",
+    "on-click": "foot -e ncdu",
+  },
+  "network": {
+    "format": "⚠ Disabled",
+    "format-wifi": " {essid} ",
+    "format-ethernet": "  Wired ",
+    "format-disconnected": "Disconnected ",
+    "on-click": "networkmanager_dmenu"
+  },
+
+  "ext/workspaces": {
+    "format": "{icon}",
+    "ignore-hidden": false,
+    "on-click": "activate",
+    "sort-by-id": true
+  },
+  "dwl/window": {
+    "format": "[{layout}] {title}",
+    "max-length": 40,
+    "separate-outputs": false
+  },
+  "custom/sep": {
+    "format": "|",
+    "interval": 0
+  },
+  "pulseaudio": {
+    "format": "{icon}{volume:>3}% ",
+    "format-muted": " muted",
+    "format-icons": {
+    "default": ["", ""],
+    },
+    "on-click": "foot -e pulsemixer"
+  },
+
+ "battery": {
+         "interval":30,
+         "states": {
+             "good": 95,
+             "warning": 30,
+             "critical": 20
+         },
+         "format": "{capacity}% {icon}",
+         "format-charging": "{capacity}% 󰂄",
+         "format-plugged": "{capacity}% 󰂄 ",
+         "format-alt": "{time} {icon}",
+         "format-icons": [
+             "󰁻",
+         "󰁼",
+         "󰁾",
+         "󰂀",
+         "󰂂",
+         "󰁹"
+         ],
+  },
+  "tray": {
+    "spacing": 10
+  }
+}
