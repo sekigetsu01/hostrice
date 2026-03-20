@@ -52,7 +52,7 @@ Rectangle {
             Repeater {
                 model: [[-2, -2], [2, -2], [-2, 2], [2, 2], [-3, 0], [3, 0], [0, -3], [0, 3]]
                 Text {
-                    font.pointSize: 75
+                    font.pointSize: 90
                     font.weight: Font.Black
                     color: "#000000"
                     x: modelData[0]
@@ -63,7 +63,7 @@ Rectangle {
 
             Text {
                 id: clockText
-                font.pointSize: 75
+                font.pointSize: 90
                 font.weight: Font.Black
                 color: root.theme.clock
                 text: {
@@ -176,7 +176,7 @@ Rectangle {
         Text {
             Layout.alignment: Qt.AlignHCenter
             Layout.topMargin: 2
-            font.pointSize: 13
+            font.pointSize: 16
             font.weight: Font.Bold
             color: root.theme.locked
             style: Text.Outline
