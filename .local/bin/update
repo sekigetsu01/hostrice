@@ -1,0 +1,197 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+sudo_keep || exit 1
+
+step "Arch news"
+last=$(tac /var/log/pacman.log 2>/dev/null | grep -a -m 1 'starting full system upgrade')
+last=${last:1:24}
+[ -n "$last" ] && feed=$(curl -fsS --max-time 10 https://archlinux.org/feeds/news/) &&
+news=$(LAST="$last" python3 -I -c '
+import os, sys, re, html
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+last = os.environ.get("LAST", "")
+try:
+    since = datetime.fromisoformat(last) if last else None
+    if since and since.tzinfo is None: since = since.replace(tzinfo=timezone.utc)
+except ValueError:
+    since = None
+items = re.findall(r"<item>(.*?)</item>", sys.stdin.read(), re.S)
+if not items: sys.exit(1)
+for item in items:
+    title = re.search(r"<title>(.*?)</title>", item, re.S)
+    date = re.search(r"<pubDate>(.*?)</pubDate>", item, re.S)
+    link = re.search(r"<link>(.*?)</link>", item, re.S)
+    if not (title and date): continue
+    when = parsedate_to_datetime(date.group(1).strip())
+    if since and when <= since: continue
+    print(f"{when:%d %b %Y}  {html.unescape(title.group(1).strip())}\n             {link.group(1).strip() if link else str()}")
+' 2>/dev/null <<<"$feed")
+fetched=$?
+if [ -z "$last" ]; then
+    echo "(no earlier update found in the pacman log; showing nothing)"
+elif [ "$fetched" -ne 0 ]; then
+    echo "(couldn't check Arch news: offline, or the site is down; https://archlinux.org/news/)"
+elif [ -n "$news" ]; then
+    # shown, without stopping: if one needs you to do something, it's here to scroll back to
+    warn "New since your last update ($last):"
+    printf '%s\n' "$news"
+else
+    echo "Nothing new."
+fi
+
+step "System packages"
+upgraded=false
+unlock_pacman
+# the keys that sign Arch's packages, refreshed here once a week rather than by a timer of their own
+# (it looks each key up one by one: about 30 quiet seconds, so not on every update)
+keys=${XDG_STATE_HOME:-$HOME/.local/state}/dots/keyring-refresh
+if [ -z "$(find "$keys" -mtime -7 2>/dev/null)" ]; then
+    echo "Refreshing the keys that sign packages (once a week, about 30 seconds)…"
+    if sudo timeout 120 systemctl start archlinux-keyring-wkd-sync.service >/dev/null 2>&1; then
+        mkdir -p "${keys%/*}" && touch "$keys"
+    else
+        sudo systemctl stop archlinux-keyring-wkd-sync.service >/dev/null 2>&1
+        echo "(couldn't refresh them; pacman still checks signatures with the keys you have)"
+    fi
+fi
+if sudo pacman -Syu --noconfirm; then upgraded=true
+else warn "pacman didn't finish. Scroll up for the error. If it says two packages conflict, run  sudo pacman -Syu  yourself and answer the question."; fi
+
+# straight through: no questions, no build-file diffs
+step "AUR packages"
+aur_ok=true
+if ! $upgraded; then
+    echo "Skipped until the system update above goes through."
+elif aur=$(yay -Qua --devel) && [ -n "$aur" ]; then
+    printf '%s\n' "$aur"
+    yay -Sua --devel --sudoloop --noconfirm --answerclean None --answerdiff None --answeredit None --mflags --nocheck ||
+        { aur_ok=false; warn "yay didn't finish. Scroll up for the error. Everything else is up to date."; }
+else
+    echo "Nothing to update."
+fi
+# AUR programs are built here, against the libraries of the day: when one of those updates to a new file name
+# (mupdf does on every release, even 1.28.5 → 1.28.6), the program asks for the old one and won't start.
+# Arch rebuilds its own packages for that; AUR ones are rebuilt here
+if $upgraded; then
+    broken=$(for p in $(pacman -Qmq); do
+        pacman -Qlq "$p" | grep -E '^/usr/(bin|lib)/[^/]+$' | while read -r f; do
+            [ -f "$f" ] && ldd "$f" 2>/dev/null | grep -q 'not found' && { echo "$p"; break; }
+        done
+    done | grep -v -- '-debug$')
+    others=$(paste -sd ' ' <<< "$broken")
+    if [ -n "$others" ]; then
+        echo "Building again against the new libraries: $others"
+        # shellcheck disable=SC2086
+        yay -S --rebuild $others --sudoloop --noconfirm --answerclean None --answerdiff None --answeredit None --mflags --nocheck ||
+            { aur_ok=false; warn "yay couldn't build $others again (the error is above), so they won't start."; }
+    fi
+fi
+
+step "System settings"
+setup_ok=true
+if $upgraded; then
+    sys-setup || { setup_ok=false; warn "sys-setup didn't finish everything (the reason is just above)."; }
+else
+    setup_ok=false
+    warn "Skipped: installing more while the update is half done can break programs. Fix the update, then run update again."
+fi
+
+# what flatpak has (id/branch, name, version, commit, app or runtime): compared at the end to say what changed
+fp_list() {
+    flatpak list --columns=application,branch,name,version,active,options 2>/dev/null |
+        awk -F'\t' '{ print $1 "/" $2 "\t" $3 "\t" $4 "\t" $5 "\t" ($6 ~ /runtime/ ? "runtime" : "app") }' | sort
+}
+fp_ok=
+if command -v flatpak >/dev/null; then
+    step "Flatpak apps"
+    fp_before=$(fp_list)
+    if flatpak update -y --noninteractive; then fp_ok=true; else fp_ok=false; fi
+fi
+
+if command -v nvim >/dev/null; then
+    step "nvim plugins"
+    if nvim --headless +PackUpdate +qa >/dev/null 2>&1; then echo "Done."
+    else warn "nvim plugin update failed (open nvim and run :PackUpdate to see why)."; fi
+fi
+
+if command -v ya >/dev/null; then
+    step "yazi plugins"
+    ya pkg upgrade || warn "yazi plugin update failed (the reason is just above)."
+fi
+
+if $upgraded && command -v cleaner >/dev/null; then
+    step "Cleaning up"
+    cleaner
+fi
+
+step "Checks"
+ok=true
+for prog in mango quickshell; do
+    bin=$(command -v "$prog") || continue
+    missing=$(ldd "$bin" 2>/dev/null | awk '/not found/ {printf "%s%s", s, $1; s = " "}')
+    if [ -n "$missing" ]; then
+        ok=false
+        if pkg=$(pacman -Qoq "$bin" 2>/dev/null); then fix="yay -S --rebuild $pkg"
+        else fix="a rebuild of $bin"; fi
+        warn "$prog is missing libraries ($missing). Don't log out yet: rebuild it with  $fix"
+    fi
+done
+# (mango 0.18.5 exits 0 even when it finds errors: its [ERROR] lines count too)
+if command -v mango >/dev/null && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/mango/config.conf" ] &&
+    { ! out=$(mango -p -c "${XDG_CONFIG_HOME:-$HOME/.config}/mango/config.conf" 2>&1) || [[ $out == *"[ERROR]"* ]]; }; then
+    ok=false
+    printf '%s\n' "$out" | tail -n 20
+    warn "The new mango doesn't accept your config (the problems are just above). Don't log out yet: fix them first."
+fi
+if [ ! -d "/usr/lib/modules/$(uname -r)" ]; then
+    warn "A new kernel was installed: reboot when you can (USB drives and some devices won't work until you do)."
+fi
+# last, where it can't scroll away: which flatpaks changed (apps by name, old version → new)
+if [ -n "$fp_ok" ]; then
+    step "Flatpak"
+    FP_BEFORE=$fp_before FP_AFTER=$(fp_list) python3 -I -c '
+import os
+def rows(v):
+    out = {}
+    for line in os.environ[v].splitlines():
+        f = line.split("\t")
+        if len(f) == 5:
+            out[f[0]] = {"name": f[1] or f[0].split("/")[0], "ver": f[2], "commit": f[3], "kind": f[4]}
+    return out
+a, b = rows("FP_BEFORE"), rows("FP_AFTER")
+def ver(x):
+    return x["ver"] or x["commit"][:7]
+apps = [(k, b[k]) for k in sorted(b, key=lambda k: b[k]["name"].lower()) if b[k]["kind"] == "app"]
+upd = [(k, x) for k, x in apps if k in a and a[k]["commit"] != x["commit"]]
+new = [(k, x) for k, x in apps if k not in a]
+gone = [a[k] for k in sorted(a) if k not in b and a[k]["kind"] == "app"]
+rt_upd = [x["name"] for k, x in b.items() if x["kind"] == "runtime" and k in a and a[k]["commit"] != x["commit"]]
+rt_new = [x["name"] for k, x in b.items() if x["kind"] == "runtime" and k not in a]
+rt_gone = [x["name"] for k, x in a.items() if x["kind"] == "runtime" and k not in b]
+B, R = "\033[1;32m", "\033[0m"
+for k, x in upd:
+    old = ver(a[k])
+    print(f"  {B}Updated{R} {x["name"]}: " + (f"{old} → {ver(x)}" if old != ver(x) else f"{ver(x)} (a new build)"))
+for k, x in new:
+    print(f"  {B}Installed{R} {x["name"]} {ver(x)}")
+for x in gone:
+    print(f"  Removed {x["name"]}")
+def some(names):
+    names = sorted(set(names))
+    return ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
+if rt_upd:
+    print(f"  Runtimes updated ({len(rt_upd)}): {some(rt_upd)}")
+if rt_new:
+    print(f"  Runtimes added ({len(rt_new)}): {some(rt_new)}")
+if rt_gone:
+    print(f"  Runtimes removed ({len(rt_gone)}): {some(rt_gone)}")
+if not (upd or new or gone or rt_upd or rt_new or rt_gone):
+    print("  Nothing updated: every flatpak was already up to date.")
+'
+    $fp_ok || warn "flatpak update didn't finish (the reason is under Flatpak apps above): what's listed here did change."
+fi
+
+if $ok && $upgraded && $setup_ok && $aur_ok && ${fp_ok:-true}; then [ -d "/usr/lib/modules/$(uname -r)" ] && echo "All good."; exit 0; else exit 1; fi

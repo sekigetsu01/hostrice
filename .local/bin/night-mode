@@ -1,0 +1,66 @@
+#!/bin/bash
+# Night mode, from dim_start to night_end in times.conf: the screen goes red (nightred) and, as it starts, as dim as it
+# goes (the night wallpapers have their own time, night_start: wallpaper, night.timer).
+#   night-mode          dim.service runs it as dim_start and night_end come round: red + dim at night, normal colours by day
+#   night-mode --login  at login (mango): red if it's past dim_start, brightness left alone
+#   night-mode off      normal colours now (back on at the next night start or login)
+#   night-mode up|down  redder / less red (Super+Right / Super+Left), any time of day; all the way down turns it off
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/times.conf
+start=$(awk '$1=="dim_start"{print $2}' "$conf" 2>/dev/null); start=${start:-01:00}
+end=$(awk '$1=="night_end"{print $2}' "$conf" 2>/dev/null); end=${end:-05:00}
+# how red, 0 (normal) .. 100 (pure red): kept here, nightred reads it
+LEVEL_FILE=${XDG_STATE_HOME:-$HOME/.local/state}/nightred/level
+STEP=10
+
+m() { local h=${1%%:*} mi=${1##*:}; echo $((10#$h * 60 + 10#$mi)); }
+# a minute ahead: the timer can fire a moment before the minute it is set for ticks over
+now=$(m "$(date -d "+1 min" +%H:%M)") s=$(m "$start") e=$(m "$end")
+if (( s > e ? now >= s || now < e : now >= s && now < e )); then night=true; else night=false; fi
+
+red_on() { pgrep -xu "$USER" nightred >/dev/null || setsid -f "$HOME/.local/bin/nightred" >/dev/null 2>&1; }
+red_off() { pkill -xu "$USER" nightred; }
+
+level() { local l; read -r l 2>/dev/null < "$LEVEL_FILE"; [[ $l =~ ^[0-9]+$ ]] || l=60; echo "$l"; }
+
+# redder / less red; a notification shows the level, replacing the last one instead of piling up.
+# The file keeps the last level it was on, so after going all the way down Super+Right brings it back from 10.
+step() {
+    local l old msg id
+    l=$(level)
+    if pgrep -xu "$USER" nightred >/dev/null; then
+        old=$l
+        l=$((l + $1))
+        ((l > 100)) && l=100
+        # already all the way red: nothing to change or say
+        ((l == old)) && return
+        if ((l <= 0)); then
+            echo "$STEP" > "$LEVEL_FILE"
+            red_off
+            msg="off"
+        else
+            echo "$l" > "$LEVEL_FILE"
+            pkill -USR1 -xu "$USER" nightred
+            msg="$l%"
+        fi
+    elif (($1 > 0)); then
+        ((l < STEP)) && l=$STEP
+        mkdir -p "${LEVEL_FILE%/*}"
+        echo "$l" > "$LEVEL_FILE"
+        red_on
+        msg="$l%"
+    else
+        # already off: nothing to change or say
+        return
+    fi
+    read -r id 2>/dev/null < "$LEVEL_FILE.nid"
+    notify-send -a "Night mode" -t 1500 -p ${id:+-r "$id"} "Red screen: $msg" > "$LEVEL_FILE.nid"
+}
+
+case $1 in
+    off) red_off ;;
+    up) step $STEP ;;
+    down) step -$STEP ;;
+    --login) $night && red_on ;;
+    *) if $night; then red_on; brightnessctl -q -n1 set 0; else red_off; fi ;;
+esac
+exit 0

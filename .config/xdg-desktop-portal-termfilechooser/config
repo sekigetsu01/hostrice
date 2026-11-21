@@ -1,0 +1,15 @@
+# yazi as the file picker (Glide, Brave, LibreOffice, GTK and Electron apps).
+# Keys when saving: q saves where you are, r renames, D (delete it) or Q
+# cancels the download. Opening: Enter picks, q cancels. Folders: go into
+# the folder and press q, Q cancels.
+# After editing: systemctl --user restart xdg-desktop-portal-termfilechooser
+
+[filechooser]
+cmd=yazi-picker.sh
+# Saving: yazi-picker.sh makes its own placeholder for the file (shown in
+# yazi so you can rename it and take it to another folder), not this one
+create_help_file=0
+# Saving and opening always start in ~/Downloads
+default_dir=$HOME/Downloads
+open_mode=default
+save_mode=default

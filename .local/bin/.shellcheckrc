@@ -1,0 +1,2 @@
+# shellcheck treats the scripts here as one program with ~/.local/lib/common.sh, which most of them source
+external-sources=true

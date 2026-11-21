@@ -1,0 +1,178 @@
+#!/bin/bash
+# send: copies files and folders to another computer over SSH (rsync), asking where each time.
+#   send FILE|FOLDER…        asks "Send to:" (what you typed last time already filled in), then sends them
+#                            there; a folder goes over as the folder itself. S in yazi does this for the selection
+#   send --setup [USER@ADDRESS [NAME]]
+#                            once, on this computer: asks a short name for that computer (laptop, say) and adds it
+#                            to ~/.ssh/config, so NAME works in ssh, rsync and here; puts your SSH key there (its
+#                            password, once), rsync on it too, and NAME filled in next time you send. Given a name
+#                            already in ~/.ssh/config instead of an address, it uses that
+#   send --receive           once, on the computer that receives: turns its SSH server on, and says what to give
+#                            send --setup on the sending one
+# Where to: HOST:PATH, like host:~/Pictures/ (host is in ~/.ssh/config) or user@192.168.1.20:~/inbox/. A PATH ending
+# in / is a folder (made if it isn't there), the files go into it; without, a single file is sent under that name.
+# Just a path, no HOST: on the computer you sent to last. Sending again picks up where a stopped send left off, and
+# skips what's already there unchanged.
+APP=send
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/send
+LAST=$STATE/last
+mkdir -p "$STATE"
+
+# from yazi (S) the window closes when this ends: on a problem, wait so it can be read
+hold() { [ -n "${YAZI_ID:-}" ] && { printf '\nPress Enter to go back. '; read -r _; }; }
+fail() { printf '\e[1;31m%s\e[0m\n' "$*" >&2; notify --urgency=critical "Send failed" "$*"; hold; exit 1; }
+
+# NAME for [USER@]ADDRESS in ~/.ssh/config: its old entry out, the new one before 'Host *' (ssh takes the first match)
+entry() {
+    local name=$1 to=$2 user="" addr=$2 conf=$HOME/.ssh/config block
+    [[ $to == *@* ]] && { user=${to%%@*}; addr=${to#*@}; }
+    mkdir -p -m 700 "$HOME/.ssh"
+    [ -e "$conf" ] || printf 'Host *\n\tAddKeysToAgent yes\n' > "$conf"
+    block="Host $name"$'\n'"    HostName $addr"$'\n'
+    [ -n "$user" ] && block+="    User $user"$'\n'
+    (umask 077; awk -v n="$name" -v b="$block" '
+        /^[ \t]*[Hh]ost[ \t]/ { skip = (NF == 2 && $2 == n) }
+        /^[ \t]*[Hh]ost[ \t]+\*[ \t]*$/ && !done { printf "%s\n", b; done = 1 }
+        !skip { print }
+        END { if (!done) printf "\n%s", b }' "$conf" > "$conf.new") && mv -f "$conf.new" "$conf" ||
+        fail "couldn't write $conf"
+    say "$name = $to (in ~/.ssh/config)"
+}
+
+# 'send receive' and 'send setup' as well, without the dashes (unless a file of that name is here: then it's sent)
+case ${1:-} in receive | setup) [ -e "$1" ] || set -- "--$1" "${@:2}" ;; esac
+
+case ${1:-} in
+--setup)
+    need ssh ssh-copy-id
+    to=${2:-}
+    [ -n "$to" ] || { read -r -e -p "Computer to send to (user@address, or a name in ~/.ssh/config): " to || exit 1; }
+    [ -n "$to" ] || exit 1
+    key=$HOME/.ssh/id_ed25519
+    if [ ! -e "$key" ]; then
+        step "Making your SSH key (choose its passphrase: you type it once per login)"
+        ssh-keygen -q -t ed25519 -a 100 -C "$USER@$(uname -n)" -f "$key" || fail "couldn't make the SSH key"
+    fi
+    name=${3:-}
+    while :; do
+        # an address (user@192.168.1.20, user@pc.local): a short name for it in ~/.ssh/config (replacing one of that name)
+        if [[ $to == *@* || $to == *.* || $to == *:* ]]; then
+            while [[ -z $name || $name == *[[:space:]@:/*?]* ]]; do
+                read -r -e -p "Name for it (what you'll type to send there, e.g. laptop): " name || exit 1
+            done
+            entry "$name" "$to"
+            to=$name
+        fi
+        step "Putting your key on $to (its password, once)"
+        # gives up after 10 seconds instead of waiting minutes on a computer that doesn't answer
+        ssh-copy-id -o ConnectTimeout=10 -i "$key.pub" "$to" && break
+        # why: the address not reachable from here, the computer there but its SSH server off, or a firewall on it
+        # dropping SSH (it answers ping, but SSH gets no answer at all)
+        cf=(); [ -f "$HOME/.ssh/config" ] && cf=(-F "$HOME/.ssh/config")
+        read -r addr port < <(ssh "${cf[@]}" -G "$to" 2>/dev/null | awk '$1 == "hostname" { h = $2 } $1 == "port" { p = $2 } END { print h, p }')
+        why=$(timeout 4 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$addr" "${port:-22}" 2>&1)
+        case $? in
+            0) fail "$to ($addr) answered, but the key couldn't be put there (wrong user or password?)" ;;
+        esac
+        [[ $why == *refused* ]] && fail "$to ($addr) is there, but its SSH server is off: run send --receive on it"
+        ping -c1 -W2 "$addr" >/dev/null 2>&1 &&
+            fail "$to ($addr) is there, but its firewall blocks SSH: run send --receive on it (it lets SSH in)"
+        # not reachable: most likely its address changed (or this is a VM): ask for the one to use now
+        printf '\n\e[1;33mCan'"'"'t reach %s at %s from here: wrong address, or it'"'"'s on another network.\e[0m\n' "$to" "$addr"
+        say "send --receive on that computer shows its address."
+        if systemd-detect-virt -q --vm 2>/dev/null; then
+            gw=$(ip route 2>/dev/null | awk '/^default/ { print $3; exit }')
+            [ -n "$gw" ] && say "This is a virtual machine: the computer it runs on is $gw from here."
+        fi
+        read -r -e -p "New address for $to (user@address; empty stops): " new || exit 1
+        [ -n "$new" ] || exit 1
+        name=$to to=$new
+    done
+    step "rsync on $to"
+    if ssh "$to" 'command -v rsync >/dev/null'; then
+        say "already there"
+    else
+        ssh -t "$to" 'sudo pacman -S --needed --noconfirm rsync' || fail "couldn't install rsync on $to"
+    fi
+    printf '%s\n' "$to:~/" > "$LAST"
+    step "Done"
+    say "send FILE… (or S in yazi) now offers $to:~/"
+    exit 0 ;;
+--receive)
+    need systemctl
+    step "Turning on the SSH server"
+    sudo systemctl enable --now sshd || fail "couldn't turn on sshd (is openssh installed?)"
+    : > "$STATE/receive"   # sys-setup leaves the SSH server on from now on
+    # sys-setup's firewall drops everything coming in that it doesn't list: SSH let in, now and from the next boot
+    # on (the same line sys-setup writes, so running it again keeps it)
+    rule='        tcp dport 22 accept                       # SSH: answers only once send receive turned its server on'
+    if sudo nft list chain inet filter input >/dev/null 2>&1 &&
+        ! sudo nft list chain inet filter input | grep -q 'tcp dport 22 accept'; then
+        step "Letting SSH through the firewall"
+        sudo nft add rule inet filter input tcp dport 22 accept || fail "couldn't let SSH through the firewall"
+    fi
+    if [ -f /etc/nftables.conf ] && grep -q 'iifname "virbr\*" accept' /etc/nftables.conf &&
+        ! grep -q 'tcp dport 22 accept' /etc/nftables.conf; then
+        sudo sed -i "/iifname \"virbr\\*\" accept/a\\$rule" /etc/nftables.conf || fail "couldn't save the firewall change"
+    fi
+    command -v rsync >/dev/null || sudo pacman -S --needed --noconfirm rsync || fail "couldn't install rsync"
+    step "Done. On the computer that sends, run the one line for where it is:"
+    # each address is this computer on one network: the real one (wifi, cable) for other computers, a VM network
+    # (libvirt's bridges) for the VMs on it
+    declare -A vmnet=()
+    while read -r n; do
+        [ -n "$n" ] || continue
+        b=$(virsh -c qemu:///system net-info "$n" 2>/dev/null | awk '$1 == "Bridge:" { print $2 }')
+        [ -n "$b" ] && vmnet[$b]=$n
+    done < <(virsh -c qemu:///system net-list --name 2>/dev/null)
+    while read -r dev cidr; do
+        a=${cidr%/*}
+        if [ -n "${vmnet[$dev]:-}" ]; then where="a VM on the ${vmnet[$dev]} network"
+        elif [[ $dev == virbr* || $dev == docker* || $dev == br-* ]]; then where="a VM or container on $dev"
+        else
+            ssid=$(nmcli -t -f DEVICE,CONNECTION dev 2>/dev/null | awk -F: -v d="$dev" '$1 == d { print $2 }')
+            where="another computer on your network${ssid:+ ($ssid)}"
+        fi
+        printf '  %-36s from %s\n' "send --setup $USER@$a" "$where"
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{ print $2, $4 }')
+    echo
+    say "Just one of them, once. The address can change (a reboot, the router restarting, another network): if"
+    say "sending stops working, send asks for the new one; send receive here shows it."
+    exit 0 ;;
+-h|--help|"")
+    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    [ -n "${1:-}" ]; exit ;;
+esac
+
+need rsync ssh
+items=()
+for f; do
+    [ -e "$f" ] || fail "no such file: $f"
+    items+=("${f%/}")   # the folder itself, not just what's inside it
+done
+
+last=$(cat "$LAST" 2>/dev/null)
+n=${#items[@]}
+if (( n == 1 )); then what=${items[0]##*/}; else what="$n items"; fi
+printf '\e[1mSend %s to\e[0m (HOST:PATH · empty or Ctrl+C cancels)\n' "$what"
+read -r -e -i "${last:-host:~/}" -p "> " dest || exit 0
+dest=${dest#"${dest%%[![:space:]]*}"}; dest=${dest%"${dest##*[![:space:]]}"}
+[ -n "$dest" ] || exit 0
+# just a path: on the computer sent to last
+if [[ $dest != *:* ]]; then
+    [[ $last == *:* ]] || fail "say which computer: HOST:PATH"
+    dest=${last%%:*}:$dest
+fi
+# more than one thing always goes into a folder
+(( n > 1 )) && [[ $dest != */ && $dest != *: ]] && dest+=/
+printf '%s\n' "$dest" > "$LAST"
+
+echo
+if rsync -avh --partial --progress --mkpath -- "${items[@]}" "$dest"; then
+    notify "Sent" "$what → $dest"
+else
+    fail "$what → $dest didn't finish (send again to pick up where it stopped)"
+fi

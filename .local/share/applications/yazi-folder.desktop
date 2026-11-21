@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=yazi (kitty)
+Comment=Open folders in yazi inside a kitty terminal
+Exec=kitty yazi %F
+Icon=yazi
+Terminal=false
+NoDisplay=true
+MimeType=inode/directory;

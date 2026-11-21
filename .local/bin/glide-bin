@@ -1,0 +1,27 @@
+#!/bin/sh
+# Glide, telling sites its time zone is UTC, so it doesn't give away where you are (even through the VPN).
+# Starting (Glide isn't running yet): it opens with your start tabs (~/.config/glide/start-tabs, set with <leader>T in
+# Glide) as its own first tabs, all at once; a link it's started with opens first, and shows. Running already: as asked
+# (a new window, or the link in a new tab).
+TABS=$HOME/.config/glide/start-tabs
+
+running() {
+    # the profile's lock names the process that holds it (it's left behind when Glide stops)
+    for l in "$HOME"/.config/glide/glide/*/lock; do
+        p=$(readlink "$l" 2>/dev/null) || continue
+        p=${p##*+}
+        [ -n "$p" ] && kill -0 "$p" 2>/dev/null && grep -q glide "/proc/$p/comm" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+case " $* " in *" --private-window "*) TABS= ;; esac   # (not into a private window)
+if [ -n "$TABS" ] && [ -s "$TABS" ] && ! running; then
+    tabs=$(grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$TABS")
+    # (addresses have no spaces: one word each)
+    set -f
+    # shellcheck disable=SC2086
+    set -- "$@" $tabs
+    set +f
+fi
+TZ=UTC exec /usr/bin/glide-bin "$@"

@@ -1,0 +1,11 @@
+#!/bin/sh
+# calc-or KEY DISPATCH: mango's window keys. With the calculator open (it leaves qs-calc-side while it is) and holding the
+# keyboard, it may deal with KEY itself (it moves like a window, or hands the keyboard to the windows); otherwise, or
+# then too for Super+Shift+j / k, mango does DISPATCH as always.
+key=$1
+shift
+if [ -e "${XDG_RUNTIME_DIR:-/tmp}/qs-calc-side" ] &&
+    [ "$(timeout 1 qs ipc -p "$HOME/.config/quickshell" call calcKeys window "$key" 2>/dev/null)" = true ]; then
+    exit 0
+fi
+exec mmsg dispatch "$@"

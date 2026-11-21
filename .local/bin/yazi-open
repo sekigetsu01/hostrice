@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# yazi's "open" (Enter / l): opens each file with xdg-open, one after the other, as an ordinary (tiled) window.
+# What the viewers print goes to ~/.cache/yazi-open.log (its last 200 lines kept), to see why one didn't open.
+import os
+import subprocess
+import sys
+import time
+
+LOG = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "yazi-open.log")
+try:
+    with open(LOG, errors="replace") as fh:
+        keep = fh.readlines()[-200:]
+    with open(LOG, "w") as fh:
+        fh.writelines(keep)
+except OSError:
+    pass
+
+for f in sys.argv[1:]:
+    with open(LOG, "a") as log:
+        log.write(f"--- {time.strftime('%F %T')} {f}\n")
+        log.flush()
+        cmd = ["xdg-open", f]
+        try:
+            rc = subprocess.run(cmd, stdout=log, stderr=log).returncode
+        except OSError:
+            continue
+        if rc:
+            log.write(f"    exited with {rc}\n")

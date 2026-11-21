@@ -1,0 +1,29 @@
+#!/bin/bash
+# Opens web links and local HTML pages: the default for http/https and text/html (any app), and kitty's links.
+# From Glide: a new tab there. Glide open elsewhere: a new tab in it (the window you used last),
+# and you go to its tag; it stays where it is. Glide not open: a new window on the tag to your left if that's empty, else
+# the nearest empty one to the right, else this one (mm freetag).
+MM=$HOME/.config/mango/scripts/mm
+
+from_glide() {
+    mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+c = next((c for c in json.load(sys.stdin).get("clients", []) if c.get("is_focused")), {})
+sys.exit(0 if (c.get("appid") or "").startswith("glide") else 1)' 2>/dev/null
+}
+glide_open() {
+    mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+sys.exit(0 if any((c.get("appid") or "").startswith("glide") for c in json.load(sys.stdin).get("clients", [])) else 1)' 2>/dev/null
+}
+# Glide through its wrapper (it tells sites the time zone is UTC)
+browser() {
+    from_glide && exec "$HOME/.local/bin/glide-bin" "$@"
+    if glide_open; then
+        # mm attention takes you to the Glide window that gets it, instead of bringing it here
+        touch "${XDG_RUNTIME_DIR:-/tmp}/open-link-follow"
+        exec "$HOME/.local/bin/glide-bin" "$@"
+    fi
+    "$MM" freetag >/dev/null
+    exec "$HOME/.local/bin/glide-bin" --new-window "$@"
+}
+
+browser "$@"

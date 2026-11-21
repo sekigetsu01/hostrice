@@ -1,0 +1,129 @@
+#!/bin/bash
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+used() { df --output=source,used -B1 / "$HOME" | awk 'NR > 1 && !seen[$1]++ {s += $2} END {print s + 0}'; }
+size() { local s; s=$("$@" 2>/dev/null); printf '%8s  ' "${s%%$'\t'*}"; }
+gone() { size du -sh "$1"; echo "${1/#$HOME/\~}"; rm -rf "$1"; }
+
+sudo -v || exit 1
+busy=false
+pacman_busy && busy=true
+before=$(used)
+
+step "Orphaned packages"
+first=true
+$busy && { echo "pacman is busy in another window: packages left alone this time."; first=false; }
+while ! $busy && orphans=$(pacman -Qdtq) && [ -n "$orphans" ]; do
+    first=false
+    sudo pacman -Rns --noconfirm $orphans || break
+done
+$first && echo "None."
+
+step "Package cache"
+if $busy; then
+    echo "pacman is busy in another window: package cache left alone this time."
+else
+    size sudo du -sh /var/cache/pacman/pkg; echo /var/cache/pacman/pkg
+    sudo find /var/cache/pacman/pkg -mindepth 1 -delete
+    [ -d "$HOME/.cache/yay" ] && gone "$HOME/.cache/yay"
+fi
+
+step "System"
+sudo journalctl --vacuum-time=2weeks 2>&1 | tail -n 1
+sudo find /var/lib/systemd/coredump -mindepth 1 -delete 2>/dev/null
+if [[ ,$(findmnt -no OPTIONS -T /var/tmp), == *,noatime,* ]]; then
+    echo "(/var/tmp is on a noatime drive, so its old files were left alone)"
+elif command -v fuser >/dev/null; then
+    sudo find /var/tmp -mindepth 1 -maxdepth 1 ! -name 'systemd-private-*' -mtime +10 -exec sh -c '
+        for e; do
+            [ -z "$(find "$e" \( -type f -atime -10 -o -mtime -10 -o -ctime -10 \) -print -quit)" ] &&
+                [ -z "$(find "$e" -print0 | xargs -0 -r fuser 2>/dev/null)" ] && rm -rf -- "$e"
+        done' sh {} +
+else
+    echo "(fuser isn't installed, so old files in /var/tmp were left alone: sudo pacman -S psmisc)"
+fi
+echo "Crash dumps and old temp files: done."
+
+if command -v flatpak >/dev/null; then
+    step "Unused Flatpak runtimes"
+    flatpak uninstall --unused -y --noninteractive
+fi
+
+step "App caches"
+for dir in \
+    "$HOME/.cache/thumbnails" \
+    "$HOME/.cache/pip" \
+    "$HOME/.cache/yarn" \
+    "$HOME/.cache/go-build" \
+    "$HOME/.cache/typescript" \
+    "$HOME/.cache/mesa_shader_cache" \
+    "$HOME/.cache/mesa_shader_cache_db" \
+    "$HOME/.cache/nvidia" \
+    "$HOME/.cache/fontconfig" \
+    "$HOME/.nv/GLCache" \
+    "$HOME/.npm/_cacache" \
+    "$HOME/.cargo/registry/cache" \
+    "$HOME/.cargo/git/db" \
+    "$HOME/.local/share/Trash" \
+    "$HOME"/.cache/qtshadercache* \
+    "$HOME"/.var/app/*/cache; do
+    [ -e "$dir" ] && gone "$dir"
+done
+
+while IFS= read -r -d '' dir; do
+    parent=${dir%/*}
+    if [ -e "$parent/Local State" ] || [ -e "$parent/Preferences" ]; then gone "$dir"; fi
+done < <(find "$HOME/.config" "$HOME/.var/app" -maxdepth 5 -type d \
+    \( -name Cache -o -name 'Code Cache' -o -name GPUCache -o -name DawnCache \
+    -o -name DawnGraphiteCache -o -name DawnWebGPUCache -o -name ShaderCache \) -print0 2>/dev/null)
+
+if [[ ,$(findmnt -no OPTIONS -T "$HOME/.cache"), == *,noatime,* ]]; then
+    echo "      ~/.cache is on a noatime drive: unused app caches left alone"
+else
+    old=0
+    for dir in "$HOME"/.cache/* "$HOME"/.cache/.[!.]*; do
+        [ -e "$dir" ] || continue
+        case ${dir##*/} in
+            wal|zsh|keepassxc|yazi|nvim|quickshell*|qs_*) continue ;;
+            # work in progress, not caches: unfinished audiobook parts and OCR, transcripts, Books' state
+            speak|transcribe|books) continue ;;
+            # IOPaint's model (watermark): gone, its next start downloads 200 MB and gives up waiting
+            torch) continue ;;
+        esac
+        [ -n "$(find "$dir" \( \( -type f -atime -30 \) -o -mtime -30 -o -ctime -30 \) -print -quit 2>/dev/null)" ] && continue
+        gone "$dir"
+        old=$((old + 1))
+    done
+    echo "      $old unused app caches in ~/.cache"
+fi
+
+step "Tidying"
+# downloads kept only for installing: what's installed keeps working, a fresh install fetches them again
+if command -v uv >/dev/null && [ -d "$(uv cache dir 2>/dev/null)" ]; then
+    size du -sh "$(uv cache dir)"; echo "Python package downloads (uv)"
+    timeout 60 uv cache clean -q 2>/dev/null || echo "          (uv is busy installing something: left for next time)"
+fi
+[ -e "$HOME/.cache/puccinialin" ] && gone "$HOME/.cache/puccinialin"   # a Rust toolchain fetched to build one Python package
+# caches of apps that aren't installed any more: the folder, then the commands that would use it
+for app in "BraveSoftware brave brave-browser brave-beta" "google-chrome google-chrome-stable" "chromium chromium" \
+    "vivaldi vivaldi vivaldi-stable" "spotify spotify" "discord discord" "Code code" "VSCodium codium" "zoom zoom"; do
+    read -r dir cmds <<< "$app"
+    [ -e "$HOME/.cache/$dir" ] || continue
+    for c in $cmds; do command -v "$c" >/dev/null && continue 2; done
+    gone "$HOME/.cache/$dir"
+done
+# containers: build leftovers, and images nothing uses (never Dangerzone's: it needs it to work)
+if command -v podman >/dev/null; then
+    podman image prune -f >/dev/null 2>&1
+    podman images --format '{{.ID}} {{.Repository}}:{{.Tag}}' 2>/dev/null | while read -r id name; do
+        case $name in *dangerzone*) continue ;; esac
+        podman rmi "$id" >/dev/null 2>&1 && echo "          ${name%:<none>} (container image)"
+    done
+fi
+
+rm -f "$HOME/.local/share/recently-used.xbel"
+
+after=$(used)
+freed=$(( before - after ))
+[ "$freed" -lt 0 ] && freed=0
+printf '\n\e[1mFreed %s\e[0m\n' "$(numfmt --to=iec --suffix=B "$freed")"

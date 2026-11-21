@@ -1,0 +1,114 @@
+#!/bin/bash
+# Super+q: close the focused window; held, close every window on this tag.
+# An nvim saves and quits first. The wallpaper selector closes instead when it's open.
+# close --id N: close that window (bookset uses it).
+rt=${XDG_RUNTIME_DIR:-/tmp}
+
+clients() {  # visible (the focused one first) | focused | one ID: "id appid focused(1/0) title" lines
+    mmsg get all-clients 2>/dev/null | python3 -I -c '
+import json, sys
+cs = json.load(sys.stdin).get("clients", [])
+mode, arg = sys.argv[1], (sys.argv[2:] or [""])[0]
+mon = next((c["monitor"] for c in cs if c.get("is_focused")), None)
+line = lambda c: "%s %s %d %s" % (c["id"], c.get("appid") or "-", bool(c.get("is_focused")), (c.get("title") or "").replace("\n", " "))
+if mode == "visible":
+    # every window on the tag showing, not only the ones drawn (behind a maximized window they are not) and found by
+    # the active monitor, not the focused window (there may be none just after the first press closed one); minimized
+    # ones (Books hidden with Alt+b) are left
+    import subprocess
+    tags = set()
+    try:
+        r = subprocess.run(["mmsg", "get", "all-monitors"], capture_output=True, text=True, timeout=2)
+        m = next(m for m in json.loads(r.stdout).get("monitors", []) if m.get("active"))
+        mon, tags = m.get("name"), set(m.get("active_tags") or [])
+    except (OSError, ValueError, StopIteration, subprocess.SubprocessError):
+        pass
+    vis = [c for c in cs if c.get("monitor") == mon and not c.get("is_minimized")
+           and (c.get("is_visible") or tags & set(c.get("tags") or []))]
+    print("\n".join(line(c) for c in sorted(vis, key=lambda c: not c.get("is_focused"))))
+elif mode == "focused":
+    c = next((c for c in cs if c.get("is_focused")), None)
+    if c: print(line(c))
+elif mode == "one":
+    c = next((c for c in cs if str(c["id"]) == arg), None)
+    if c: print(line(c))
+' "$@"
+}
+
+is_nvim() { [[ ($1 == kitty || $1 == notepad) && $2 == *[Nn][Vv][Ii][Mm] ]]; }
+
+kill_id() { mmsg dispatch killclient "client,$1" >/dev/null 2>&1; }
+
+# the socket in nvim-focused (written by the nvim that has focus) once it's none of SKIP: TRIES x 20 ms
+SKIP=
+claimed() {
+    local s
+    for _ in $(seq "$1"); do
+        s=$(cat "$rt/nvim-focused" 2>/dev/null)
+        if [ -S "$s" ] && [[ " $SKIP " != *" $s "* ]]; then printf '%s' "$s"; return 0; fi
+        sleep 0.02
+    done
+    return 1
+}
+
+# that nvim saves every changed file and quits
+save_quit() {
+    timeout 3 nvim --headless --clean --server "$1" --remote-expr 'v:lua.SaveQuit()' 2>/dev/null </dev/null | grep -q '^saved'
+}
+
+# close_one ID APPID FOCUSED TITLE: an nvim is focused first (it then claims nvim-focused) and saves and quits;
+# anything else is closed by its id
+close_one() {
+    local sock tries=5
+    if is_nvim "$2" "$4"; then
+        if [ "$3" != 1 ]; then
+            # what's there now belongs to another nvim
+            SKIP+=" $(cat "$rt/nvim-focused" 2>/dev/null)"
+            ~/.config/mango/scripts/mm bring "$1" >/dev/null 2>&1
+            tries=25
+        fi
+        if sock=$(claimed "$tries"); then
+            SKIP+=" $sock"
+            # once nvim has quit (its socket goes), the window closes at once: nvim in a terminal's shell leaves the
+            # window open, so waiting for it to go by itself only added seconds
+            save_quit "$sock" && for _ in $(seq 100); do [ -S "$sock" ] || break; sleep 0.02; done
+        fi
+    fi
+    kill_id "$1"
+}
+
+if [ "${1:-}" = --id ]; then
+    read -r id app f title <<< "$(clients one "$2")"
+    [ -n "$id" ] && close_one "$id" "$app" "$f" "$title"
+    exit
+fi
+
+# a held key repeats (the first after 0.18 s, then every 11 ms); a quick second tap comes alone. The first repeat
+# closes the rest of the tag once another has come in; later repeats do nothing
+stamp=$rt/close-stamp held=$rt/close-held
+now=${EPOCHREALTIME/[.,]/}
+last=0
+{ read -r last < "$stamp"; } 2>/dev/null
+echo "$now" > "$stamp"
+if (( now - last >= 0 && now - last < 250000 )); then
+    mkdir "$held" 2>/dev/null || exit 0
+    sleep 0.06
+    read -r latest < "$stamp"
+    if [ "$latest" != "$now" ]; then
+        nv=()
+        while read -r id app f title; do
+            [ -n "$id" ] || continue
+            if is_nvim "$app" "$title"; then nv+=("$id $app $f $title"); else kill_id "$id"; fi
+        done <<< "$(clients visible)"
+        for c in "${nv[@]}"; do
+            read -r id app f title <<< "$c"
+            close_one "$id" "$app" "$f" "$title"
+        done
+        exit
+    fi
+fi
+rm -rf "$held"
+
+[ "$(timeout 1 qs ipc call wallpaperSelector close 2>/dev/null)" = true ] && exit 0
+read -r id app f title <<< "$(clients focused)"
+[ -n "$id" ] && close_one "$id" "$app" "$f" "$title"

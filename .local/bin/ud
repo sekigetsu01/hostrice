@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# ud: publish folders in ~/github to GitHub, each as one fresh commit (its old history is replaced), after a
+# secret scan. Pick several with Tab, or name them: ud mangorice SVS
+set -uo pipefail
+
+GITHUB_DIR="$HOME/github"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/update-dotfiles"
+NAME_FILE="$STATE_DIR/usernames"      # the GitHub name, if GitHub doesn't say it
+REPO_FILE="$STATE_DIR/repos"          # published ones, the latest last (listed first in the picker)
+mkdir -p "$STATE_DIR" "$GITHUB_DIR"
+touch "$NAME_FILE" "$REPO_FILE"
+
+B=$'\e[1m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' N=$'\e[0m'
+say() { printf '%s\n' "$*"; }
+# Enter = no (for pushing past a found secret)
+askno() { local a; read -r -p "$1 [y/N] " a; [[ $a == [yY]* ]]; }
+# from yazi (U on the selected folders): what happened stays on screen until Enter
+hold() { [ -n "${YAZI_ID:-}" ] && { printf '\nPress Enter to go back. '; read -r _; }; }
+trap hold EXIT
+
+case ${1:-} in
+    -h|--help)
+        cat <<'EOF'
+ud              pick folders in ~/github (Tab picks several, Enter publishes)
+ud NAME…        publish those folders (names, or their paths: U in yazi publishes the selected ones)
+Each goes to github.com/YOU/NAME as one fresh commit, replacing what's there (the repo must exist on GitHub).
+Run dots export first for mangorice, so it matches this system.
+EOF
+        exit 0 ;;
+esac
+
+# ── which folders
+mapfile -t KNOWN < <(
+    { tac "$REPO_FILE"; for d in "$GITHUB_DIR"/*/; do [[ -d $d ]] && { d=${d%/}; printf '%s\n' "${d##*/}"; }; done; } |
+        awk 'NF && !seen[$0]++' | while IFS= read -r r; do [[ -d $GITHUB_DIR/$r ]] && printf '%s\n' "$r"; done
+)
+if (( $# )); then
+    REPOS=()
+    for a; do
+        a=${a%/}
+        # a path (from yazi): a folder right in ~/github
+        if [[ $a == */* ]]; then
+            [[ $(realpath -m -- "$a/..") == "$(realpath -m -- "$GITHUB_DIR")" ]] ||
+                { say "${R}$a isn't a folder in $GITHUB_DIR.${N}"; exit 1; }
+            a=${a##*/}
+        fi
+        REPOS+=("$a")
+    done
+else
+    (( ${#KNOWN[@]} )) || { say "No folders in $GITHUB_DIR to publish."; exit 1; }
+    mapfile -t REPOS < <(printf '%s\n' "${KNOWN[@]}" |
+        fzf --multi --prompt="Publish> " --header="Tab: pick several · Enter: publish · Esc: cancel" --height=~50% --reverse)
+    (( ${#REPOS[@]} )) || { say "Cancelled."; exit 130; }
+fi
+for r in "${REPOS[@]}"; do
+    if [[ ! $r =~ ^[A-Za-z0-9._-]+$ || $r == . || $r == .. ]]; then say "${R}'$r' isn't a valid repo name.${N}"; exit 1; fi
+    [[ -d $GITHUB_DIR/$r ]] || { say "${R}There's no folder $GITHUB_DIR/$r.${N}"; exit 1; }
+done
+
+# ── GitHub, signed in once: the key goes into the agent (one passphrase, also for the next ud), and every git
+# command after this shares one connection
+CTL=$(mktemp -u "${XDG_RUNTIME_DIR:-/tmp}/ud-ssh.XXXXXX")
+export GIT_SSH_COMMAND="ssh -o ControlMaster=auto -o ControlPath=$CTL -o ControlPersist=300"
+trap 'ssh -o ControlPath="$CTL" -O exit git@github.com >/dev/null 2>&1; hold' EXIT
+ssh-add -l >/dev/null 2>&1
+[[ $? == 1 ]] && ssh-add -q    # 1: the agent runs but has no key yet (2: no agent; ssh then asks once itself)
+hello=$($GIT_SSH_COMMAND -T git@github.com 2>&1)
+GH_NAME=$(sed -n 's/^Hi \([^!]*\)!.*/\1/p' <<< "$hello" | head -n1)
+if [[ -z $GH_NAME ]]; then
+    say "${R}Couldn't sign in to GitHub:${N} $hello"
+    say "Is your SSH key (~/.ssh/id_ed25519.pub) added on GitHub, and are you online?"
+    exit 1
+fi
+printf '%s\n' "$GH_NAME" > "$NAME_FILE"
+
+# ── what goes (no question: picking them was the answer)
+say ""
+say "Publish to ${B}github.com/$GH_NAME${N}, each as one fresh commit (what's on GitHub is replaced):"
+for r in "${REPOS[@]}"; do
+    n=$(cd "$GITHUB_DIR/$r" && find . -name .git -prune -o -type f -print | wc -l)
+    say "  ${B}$r${N}  ($n files)"
+done
+
+# ── each one
+OK=() FAILED=()
+publish() {
+    local r=$1 path=$GITHUB_DIR/$1 remote="git@github.com:$GH_NAME/$1.git" probe nested d g scan other
+    say ""
+    say "${B}── $r${N}"
+    # separate repos inside it would go up as bare links
+    nested=""
+    probe=$(mktemp -d "$GITHUB_DIR/.$r.git.XXXXXX")
+    git -C "$path" --git-dir="$probe" --work-tree=. init --quiet
+    [[ -f $path/.git/info/exclude ]] && { mkdir -p "$probe/info"; cp -f -- "$path/.git/info/exclude" "$probe/info/exclude"; }
+    while IFS= read -r d; do
+        g="$path/$d/.git"
+        [[ -f $g || -e $g/HEAD ]] || continue
+        git -C "$path" --git-dir="$probe" --work-tree=. check-ignore -q "$d" || nested+="    $d"$'\n'
+    done < <(cd "$path" && find . -path ./.git -prune -o -name .git -prune -printf '%h\n')
+    if [[ -n $nested ]]; then
+        say "${R}Skipped:${N} these folders inside it are separate git repos (move them out or git-ignore them):"
+        printf '%s' "$nested"
+        rm -rf "$probe"; FAILED+=("$r (repos inside it)"); return
+    fi
+    local NEW=(git -C "$path" --git-dir="$probe" --work-tree=.)
+    if ! { "${NEW[@]}" add . && "${NEW[@]}" commit --quiet -m "Created"; }; then
+        say "${R}Skipped:${N} nothing to commit (is it empty?)"; rm -rf "$probe"; FAILED+=("$r (empty)"); return
+    fi
+    "${NEW[@]}" branch -M main
+    "${NEW[@]}" remote add origin "$remote"
+
+    if command -v gitleaks >/dev/null; then
+        if gitleaks git --help >/dev/null 2>&1; then scan=(gitleaks git --no-banner --redact --log-level warn -v .)
+        else scan=(gitleaks detect --no-banner --redact --log-level warn -v --source .); fi
+        if (cd "$path" && GIT_DIR=$probe GIT_WORK_TREE=. "${scan[@]}" >"$probe/leaks" 2>&1); then
+            say "no secrets found"
+        else
+            cat "$probe/leaks"
+            say "${Y}gitleaks found what looks like a secret (above).${N} Nothing is pushed yet."
+            askno "Push $r anyway?" || { rm -rf "$probe"; FAILED+=("$r (secret found)"); return; }
+        fi
+    else
+        say "${Y}(gitleaks isn't installed: no secret scan)${N}"
+    fi
+
+    say "pushing…"
+    if ! "${NEW[@]}" push --quiet -f -u origin main; then
+        say "${R}The push failed (above).${N} If the repo doesn't exist yet, make it on GitHub (github.com/new), then run ud again."
+        rm -rf "$probe"; FAILED+=("$r (push failed)"); return
+    fi
+    # the fresh history becomes the folder's own; its files aren't touched
+    [[ -e $path/.git ]] && rm -rf "$path/.git"
+    mv "$probe" "$path/.git"
+    git -C "$path" config --unset core.worktree
+    # GitHub has exactly this commit?
+    if [[ $(git -C "$path" ls-remote origin refs/heads/main | cut -f1) != "$(git -C "$path" rev-parse HEAD)" ]]; then
+        say "${R}GitHub's main isn't the commit just pushed.${N} Check github.com/$GH_NAME/$r"
+        FAILED+=("$r (check GitHub)"); return
+    fi
+    other=$(git -C "$path" ls-remote --refs --heads --tags origin | awk '$2 != "refs/heads/main" { sub("refs/(heads|tags)/", "", $2); print $2 }' | paste -sd' ')
+    [[ -n $other ]] && say "${Y}GitHub also still has:${N} $other (old history; delete them there if you want only this commit)"
+    say "${G}published${N}  github.com/$GH_NAME/$r"
+    { grep -vxF -- "$r" "$REPO_FILE"; printf '%s\n' "$r"; } > "$REPO_FILE.tmp" && mv "$REPO_FILE.tmp" "$REPO_FILE"
+    OK+=("$r")
+}
+for r in "${REPOS[@]}"; do publish "$r"; done
+
+say ""
+(( ${#OK[@]} )) && say "${G}Published:${N} ${OK[*]}"
+(( ${#FAILED[@]} )) && { say "${R}Not published:${N} $(printf '%s, ' "${FAILED[@]}" | sed 's/, $//')"; exit 1; }
+exit 0

@@ -1,0 +1,177 @@
+#!/bin/bash
+S=${XDG_STATE_HOME:-$HOME/.local/state}/dots
+DL=$(xdg-user-dir DOWNLOAD 2>/dev/null); [ -d "$DL" ] && [ "$DL" != "$HOME" ] || DL=$HOME/Downloads
+mkdir -p "$S"; touch "$S/files" "$S/applied"
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$HOME/.local/lib/common.sh" || exit 1
+
+seq_of() { sed -n '1,6s/^SEQ=\([0-9][0-9]*\)$/\1/p' "$1" 2>/dev/null | head -n1; }
+applied() { awk -F'\t' -v s="$1" '$1 == s { f = 1 } END { exit !f }' "$S/applied"; }
+
+status() {
+    local n=0 s t h c
+    while IFS=$'\t' read -r s t h; do
+        if [ ! -e "$t" ]; then echo "  missing   $(short "$t")"
+        else c=$(sha256sum < "$t"); [ "${c%% *}" = "$h" ] && continue; echo "  changed   $(short "$t")  (since update $s)"; fi
+        n=$((n + 1))
+    done < "$S/files"
+    ((n)) && echo "$n file(s) changed since an update wrote them. The next update that writes one asks first." ||
+        echo "Nothing changed since the last updates."
+}
+
+apply() {
+    local f s list=() done=()
+    for f; do
+        case $f in *.part|*.crdownload|*.tmp) continue ;; esac
+        [ -f "$f" ] || { echo "Skipped $(short "$f"): no such file."; continue; }
+        s=$(seq_of "$f")
+        if [ -z "$s" ]; then echo "Skipped $(short "$f"): an old update file without a number."; continue; fi
+        applied "$s" && continue
+        [[ " ${done[*]} " == *" $s "* ]] && continue
+        done+=("$s"); list+=("$s"$'\t'"$f")
+    done
+    if ((${#list[@]} == 0)); then echo "No new updates."; return 0; fi
+    while IFS=$'\t' read -r s f <&3; do
+        echo "── update $s: ${f##*/}"
+        bash "$f" 3<&- || { echo "Update $s failed (the reason is above); later ones not applied." >&2; return 1; }
+    done 3< <(printf '%s\n' "${list[@]}" | sort -n)
+}
+
+# dots export: the dotfiles copied from this home into the repo ud publishes, so it matches this system
+REPO=$HOME/github/mangorice
+PRIVATE=${XDG_CONFIG_HOME:-$HOME/.config}/dots/private
+# whole folders, so a new script or a new file in one is taken along by itself
+EXPORT=(
+    .zshrc .zprofile .gitconfig
+    .config/apphide .config/backup/config .config/books .config/btop .config/clicker/config .config/containers
+    .config/dangerzone .config/dconf/user .config/doc .config/fastfetch .config/glow .config/keepassxc
+    .config/kitty .config/kp .config/ly .config/mango .config/mimeapps.list .config/mpv .config/nvim
+    .config/quickshell .config/qt-tweaks .config/shell .config/sioyek .config/speak .config/swayimg
+    .config/systemd .config/times.conf .config/wal .config/xdg-desktop-portal
+    .config/xdg-desktop-portal-termfilechooser .config/yazi .config/yt-dlp
+    .config/vesktop/settings .config/vesktop/settings.json .config/vesktop/themes
+    .config/glide/glide.ts .config/glide/glide.d.ts .config/glide/search.js .config/glide/start-tabs
+    .config/glide/blank.html
+    .local/bin .local/lib .local/share/characters .local/share/fonts .local/share/flatpak/overrides
+)
+# in ~/.config but not exported as a whole: app data and profiles, a login cookie, file-dialog history, other
+# projects (glide, vesktop, clicker and dconf only by the files picked above)
+NOT_EXPORTED=(glide libreoffice mozilla pulse vesktop cognitive-lab QtProject.conf .wrangler yay clicker dconf dots vpn)
+
+# the VM host's dotfiles: the same files, made by the same export, with ~/.config/dots/host's rules (left out of the
+# export too, like private): what a VM host doesn't need is left out, a few lines taken out (Glide's extra extensions)
+HOST_REPO=$HOME/github/hostrice
+HOST_RULES=${XDG_CONFIG_HOME:-$HOME/.config}/dots/host
+
+# a rules file (private, host): a path per line is left out; "FILE: TEXT" takes the lines with TEXT out of FILE
+read_rules() {
+    skip=() strip=()
+    local line
+    [ -f "$1" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line%%#*}; line=${line%"${line##*[![:space:]]}"}
+        [ -n "$line" ] || continue
+        if [[ $line == *": "* ]]; then strip+=("$line"); else skip+=("--exclude=/${line#/}"); fi
+    done < "$1"
+}
+strip_lines() {   # DIR: the strip rules read last, applied to the files in DIR
+    local line f
+    for line in "${strip[@]}"; do
+        f=$1/${line%%: *}
+        [ -f "$f" ] && { grep -vF -- "${line#*: }" "$f" > "$f.tmp"; chmod --reference="$f" "$f.tmp"; mv "$f.tmp" "$f"; }
+    done
+}
+# REPO made to match DIR (the repo's own .git is left as it is: ud replaces it when it publishes); files are compared
+# by what's in them, so a fresh clone's new timestamps don't count as changes
+sync_repo() {
+    local dir=$1 repo=$2 new added changed gone
+    mkdir -p "$repo"
+    new=$(rsync -a --checksum --delete --itemize-changes --exclude=/.git "$dir/" "$repo/") || return 1
+    added=$(grep -c '^>f+++' <<< "$new"); changed=$(grep -c '^>f[^+]' <<< "$new"); gone=$(grep -c '^\*deleting .*[^/]$' <<< "$new")
+    echo "$(short "$repo") now matches this system: $added new, $changed changed, $gone removed ($(find "$repo" -path "$repo/.git" -prune -o -type f -print | wc -l) files)."
+    grep -E '^(>f|\*deleting)' <<< "$new" | grep -v '/$' | sed -E 's/^>f\+{9} /  new      /; s/^>f[^ ]* /  changed  /; s/^\*deleting +/  removed  /' | head -n 40
+    (( added + changed + gone > 40 )) && echo "  … and $(( added + changed + gone - 40 )) more"
+    return 0
+}
+
+export_dots() {
+    local tmp p l t rel own=() f skip strip
+    tmp=$(mktemp -d) || return 1
+    trap 'rm -rf "$tmp"' RETURN
+    cd "$HOME" || return 1
+    for p in "${EXPORT[@]}"; do
+        [ -e "$p" ] || [ -L "$p" ] || { echo "  (no $p here, so it's not in the export)"; continue; }
+        own+=("$p")
+    done
+    # your own launchers: not the ones apphide hides, sys-setup writes (Dangerzone), or apps make for themselves
+    for f in .local/share/applications/*.desktop; do
+        case ${f##*/} in userapp-*|press.freedom.dangerzone.desktop) continue ;; esac
+        grep -q '^X-Apphide=true' "$f" || own+=("$f")
+    done
+    # what you keep private (~/.config/dots/private, never exported)
+    read_rules "$PRIVATE"
+    mkdir -p "$tmp/all"
+    rsync -aR --exclude=__pycache__ --exclude='*.bak' --exclude='*.orig' --exclude='*.rej' --exclude='*~' \
+        --exclude='*.swp' "${skip[@]}" "${own[@]}" "$tmp/all/" || return 1
+    strip_lines "$tmp/all"
+    # links into this home made relative, so they work under any username
+    while IFS= read -r -d '' l; do
+        t=$(readlink "$l")
+        [[ $t == "$HOME"/* ]] || continue
+        rel=$(realpath -m --relative-to="$(dirname "${l#"$tmp/all"/}")" "${t#"$HOME"/}")
+        ln -sfn "$rel" "$l"
+    done < <(find "$tmp/all" -type l -print0)
+    sync_repo "$tmp/all" "$REPO" || return 1
+    # the VM host's: the same, less what host leaves out
+    if [ -f "$HOST_RULES" ]; then
+        read_rules "$HOST_RULES"
+        mkdir -p "$tmp/host"
+        rsync -a "${skip[@]}" "$tmp/all/" "$tmp/host/" || return 1
+        strip_lines "$tmp/host"
+        sync_repo "$tmp/host" "$HOST_REPO" || return 1
+    fi
+    # new folders in ~/.config that aren't listed either way: say so, rather than leave them out without a word
+    for f in .config/* .config/.[!.]*; do
+        [ -e "$f" ] || continue
+        f=${f#.config/}
+        [[ " ${NOT_EXPORTED[*]} " == *" $f "* ]] && continue
+        [[ " ${EXPORT[*]} " == *" .config/$f "* ]] && continue
+        [[ " ${EXPORT[*]} " == *" .config/$f/"* ]] && continue   # (a file in it is exported: backup/config)
+        echo "  not exported (new?): ~/.config/$f  (add it to EXPORT or NOT_EXPORTED in dots)"
+    done
+    echo "Publish it with: ud  (pick mangorice)"
+}
+
+case ${1:-} in
+    export) export_dots ;;
+    "")
+        shopt -s nullglob
+        apply "$DL"/update-* "$DL"/fix-all* && echo && status ;;
+    status) status ;;
+    log)
+        [ -s "$S/applied" ] || { echo "No updates applied through dots yet."; exit 0; }
+        awk -F'\t' '{ printf "  %-5s %s  %s\n", $1, $2, $3 }' "$S/applied" ;;
+    clean)
+        shopt -s nullglob
+        n=0
+        for f in "$DL"/update-* "$DL"/fix-all*; do
+            case $f in *.part|*.crdownload|*.tmp) continue ;; esac
+            [ -f "$f" ] || continue
+            s=$(seq_of "$f")
+            if [ -z "$s" ]; then echo "kept $(short "$f"): no update number, so maybe not a dots update"; continue; fi
+            applied "$s" || continue
+            rm -f -- "$f" && echo "deleted $(short "$f")" && n=$((n + 1))
+        done
+        echo "$n file(s) deleted." ;;
+    -h|--help)
+        cat <<'EOF'
+dots            apply the new update files in Downloads, oldest first, then show status
+dots FILE…      apply those update files (in the right order)
+dots status     list config files you've changed since an update wrote them
+dots log        list the updates applied
+dots clean      permanently delete update files in Downloads that are already applied
+dots export     copy your dotfiles into ~/github/mangorice so it matches this system (then ud publishes it)
+EOF
+        ;;
+    *) apply "$@" ;;
+esac

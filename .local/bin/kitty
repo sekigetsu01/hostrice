@@ -1,0 +1,16 @@
+#!/bin/sh
+# kitty as one shared process, so a new window opens in the kitty that's already running
+# (started hidden at login, ~/.config/mango/config.conf) instead of starting a whole kitty, which on this VM
+# (drawn in software) is the slow part. It still waits until its window closes, as plain kitty does, so scripts
+# that wait for their window (pickers, password prompts) still work.
+k=/usr/bin/kitty
+case $1 in @*|+*|-v|--version|-h|--help) exec "$k" "$@" ;; esac
+# settings given for just this window (-o, another config) need a kitty of their own
+for a; do
+    case $a in
+        -o|-o?*|--override*|-c|-c?*|--config*|-1|--single-instance*) exec "$k" "$@" ;;
+        -*) ;;
+        *) break ;;
+    esac
+done
+exec "$k" -1 --wait-for-single-instance-window-close "$@"

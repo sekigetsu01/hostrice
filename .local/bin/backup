@@ -1,0 +1,355 @@
+#!/bin/bash
+set -o pipefail
+umask 077
+
+CFG="${XDG_CONFIG_HOME:-$HOME/.config}/backup"
+# full backups kept: the newest of each day for the last 7 days with one, of each week for 4 weeks and of each month for 6 months
+DAYS=7 WEEKS=4 MONTHS=6
+# one-off backups (some folders picked in the list, not your usual ones): the newest 3
+PARTS=3
+
+say() {
+    echo "backup: $1" >&2
+    notify-send --app-name=backup --urgency=critical "Backup" "$1" 2>/dev/null
+}
+
+mkdir -p "$CFG"
+[ -f "$CFG/config" ] || echo "BACKUP_DEST=/mnt/hdd/backup" > "$CFG/config"
+DEST=/mnt/hdd/backup DEST_VM=
+while IFS= read -r l || [ -n "$l" ]; do
+    [[ $l == BACKUP_DEST=* ]] && DEST=${l#BACKUP_DEST=}
+    [[ $l == BACKUP_DEST_VM=* ]] && DEST_VM=${l#BACKUP_DEST_VM=}
+done < "$CFG/config"
+# in a virtual machine (no backup drive there): BACKUP_DEST_VM, a folder on another computer, HOST:FOLDER over SSH
+# (host:~/backups): what you pick is copied into it as plain files, new and changed ones only, nothing there ever
+# deleted; that computer's own backup then takes it along. Into its public or private folder in there, as the
+# file vm says (svs sets it when installing: public with closed source software, else private)
+if [ -n "$DEST_VM" ] && systemd-detect-virt -q --vm 2>/dev/null; then
+    DEST=${DEST_VM%\"} DEST=${DEST#\"} DEST=${DEST%\'} DEST=${DEST#\'} DEST=${DEST%/}
+    kind=; read -r kind 2>/dev/null < "$CFG/vm"
+    [[ $kind == public || $kind == private ]] && DEST=$DEST/$kind
+fi
+DEST=${DEST%\"} DEST=${DEST#\"} DEST=${DEST%\'} DEST=${DEST#\'}
+DEST=${DEST/#\~/$HOME}
+DEST=${DEST%/}
+REMOTE='' RDIR=''
+if [[ $DEST == [!/]*:* ]]; then
+    REMOTE=${DEST%%:*} RDIR=${DEST#*:}
+    RDIR=${RDIR#\~}; RDIR=${RDIR#/}; RDIR=${RDIR:-.}   # (a path on the other computer, from its home folder)
+    [[ ${DEST#*:} == /* ]] && RDIR=${DEST#*:}
+    need=(rsync ssh)
+else
+    need=(age age-keygen zstd)
+fi
+for c in "${need[@]}"; do
+    command -v "$c" >/dev/null || { say "$c isn't installed (sudo pacman -S ${need[*]/age-keygen/})"; exit 1; }
+done
+
+# exit 75: the timer counts a missing drive as nothing to do, not as a failure (backup.service)
+need_dest() {
+    local why
+    if [ -n "$REMOTE" ]; then
+        ssh -o ConnectTimeout=5 "$REMOTE" true 2>/dev/null && return
+        why="can't reach $REMOTE over SSH (is it on? send --setup sets it up)"
+    elif [ ! -d "$DEST" ]; then why="$DEST isn't there. Mount the backup drive (the first time, make that folder)"
+    elif [[ $DEST == /mnt/* || $DEST == /media/* ]] && [ "$(findmnt -nro TARGET -T "$DEST")" = / ]; then
+        why="the backup drive isn't mounted ($DEST is on the system disk). Mount it"
+    elif [ ! -w "$DEST" ]; then why="you can't write to $DEST (sudo chown $USER: $DEST)"
+    else return; fi
+    say "${1:+$1: }$why"
+    exit 75
+}
+HOST=${HOSTNAME:-$(cat /etc/hostname 2>/dev/null)}; HOST=${HOST%%.*}; HOST=${HOST//[^A-Za-z0-9-]/}; HOST=${HOST:-pc}
+ID=$(head -c 6 /etc/machine-id 2>/dev/null); [ -n "$ID" ] && HOST=$HOST-$ID
+# when a backup was made: the time in its name, or else when the file was last changed
+when() {
+    if [[ ${1##*/} =~ ([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})([0-9]{2})(-partial)?\.tar\.zst\.age$ ]] &&
+        date -d "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}:${BASH_REMATCH[3]}" +%s 2>/dev/null; then return; fi
+    stat -c %Y -- "$1"
+}
+# the files given, oldest first
+by_time() {
+    local f
+    for f; do printf '%s %s\n' "$(when "$f")" "$f"; done | sort -n | cut -d ' ' -f 2-
+}
+# this computer's backups, oldest first: B the full ones, P the one-offs (named ...-partial)
+backups() {
+    shopt -s nullglob
+    local f=("$DEST"/backup-"$HOST"_*.tar.zst.age "$DEST"/backup-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9][0-9][0-9].tar.zst.age) l
+    shopt -u nullglob
+    B=() P=()
+    [ ${#f[@]} -gt 0 ] || return 0
+    while IFS= read -r l; do
+        if [[ $l == *-partial.tar.zst.age ]]; then P+=("$l"); else B+=("$l"); fi
+    done < <(by_time "${f[@]}")
+}
+# deletes the full backups the rules at the top don't keep, and all but the newest one-offs
+prune() {
+    local i f d w m nd=0 nw=0 nm=0
+    local -A keep=() day=() week=() month=()
+    for ((i = ${#B[@]} - 1; i >= 0; i--)); do
+        f=${B[i]}
+        read -r d w m < <(date -d "@$(when "$f")" '+%F %G-W%V %Y-%m')
+        [ -z "${day[$d]}" ] && ((nd < DAYS)) && { day[$d]=1 keep[$f]=1 nd=$((nd + 1)); }
+        [ -z "${week[$w]}" ] && ((nw < WEEKS)) && { week[$w]=1 keep[$f]=1 nw=$((nw + 1)); }
+        [ -z "${month[$m]}" ] && ((nm < MONTHS)) && { month[$m]=1 keep[$f]=1 nm=$((nm + 1)); }
+    done
+    for f in "${B[@]}"; do [ -n "${keep[$f]}" ] || rm -f -- "$f"; done
+    for ((i = 0; i < ${#P[@]} - PARTS; i++)); do rm -f -- "${P[i]}"; done
+}
+
+SEL=$CFG/paths
+HT='~'
+SKIP=(.cache private Downloads Videos .local/share/Trash .npm .cargo/registry .rustup .local/share/Steam)
+tok() {
+    local a=$1
+    case $a in "$HT") a=$HOME ;; "$HT/"*) a=$HOME/${a#"$HT/"} ;; /*) ;; *) a=$HOME/$a ;; esac
+    a=$(realpath -ms -- "$a")
+    if [ "$a" = "$HOME" ]; then echo '~'; elif [[ $a == "$HOME"/* ]]; then echo "$HT/${a#"$HOME"/}"; else echo "$a"; fi
+}
+# the saved pick, or else: all of home to a drive; nothing yet to another computer (it would all land in its folder)
+defaults() { read_sel || { if [ -n "$REMOTE" ]; then PICK=(); else PICK=('~'); fi; }; }
+read_sel() {
+    PICK=()
+    [ -f "$SEL" ] || return 1
+    local l
+    while IFS= read -r l || [ -n "$l" ]; do
+        case $l in ''|'#'*) continue ;; esac
+        PICK+=("$(tok "$l")")
+    done < "$SEL"
+    [ ${#PICK[@]} -gt 0 ]
+}
+picker() {
+    # (a terminal you can see: what mango starts has /dev/tty1, which -t takes for one)
+    [[ $(tty) == /dev/pts/* ]] && [ -t 1 ] || { echo "backup: --pick needs a terminal" >&2; exit 1; }
+    command -v fzf >/dev/null || { echo "backup: fzf isn't installed (sudo pacman -S fzf)" >&2; exit 1; }
+    defaults
+    local -A on=() seen=()
+    local t n i=0 jump="" out key hdr dt d=$'\e[2m' r=$'\e[0m' lines=() dirs=() files=()
+    dt=$(tok "$DEST")
+    for t in "${PICK[@]}"; do on[$t]=1; done
+    mapfile -d '' -t dirs < <(find "$HOME" -mindepth 1 -maxdepth 1 -type d -printf '%P\0' 2>/dev/null | LC_ALL=C sort -z)
+    mapfile -d '' -t files < <(find "$HOME" -mindepth 1 -maxdepth 1 ! -type d -printf '%P\0' 2>/dev/null | LC_ALL=C sort -z)
+    add() {
+        [[ -z ${seen[$1]} && $1 != *[$'\n\t']* && $1 != "$dt" ]] || return 0
+        seen[$1]=1 i=$((i + 1))
+        lines+=("$1"$'\t'"$2")
+        [ -n "${on[$1]}" ] && jump+="pos($i)+toggle+"
+    }
+    add '~' "$HT/  ${d}everything, except caches, Downloads, Videos and private$r"
+    for t in "${PICK[@]}"; do if [ -d "${t/#"$HT"/$HOME}" ]; then add "$t" "$t/"; else add "$t" "$t"; fi; done
+    for n in "${dirs[@]}"; do [[ $n == .* ]] || add "$HT/$n" "$HT/$n/"; done
+    for n in "${dirs[@]}"; do [[ $n == .* ]] && add "$HT/$n" "$HT/$n/"; done
+    for n in "${files[@]}"; do [[ $n == .* ]] || add "$HT/$n" "$HT/$n"; done
+    for n in "${files[@]}"; do [[ $n == .* ]] && add "$HT/$n" "$HT/$n"; done
+    for i in "${!lines[@]}"; do
+        for n in "${SKIP[@]}"; do
+            [ "${lines[i]%%$'\t'*}" = "$HT/$n" ] && lines[i]+="  ${d}(left out of $HT/)$r"
+        done
+    done
+    if [ "$1" = save ]; then
+        hdr="Back up which folders and files by default?"
+    else
+        hdr="Back up which folders and files?"
+    fi
+    out=$(printf '%s\n' "${lines[@]}" | fzf --multi --ansi --delimiter=$'\t' --with-nth=2 --layout=reverse \
+        --info=hidden --no-sort --header="$hdr" --expect=ctrl-s --bind "load:${jump}first") || { echo "Cancelled"; exit 0; }
+    key=${out%%$'\n'*}
+    mapfile -t lines <<< "${out#*$'\n'}"
+    PICK=()
+    for t in "${lines[@]}"; do [ -n "$t" ] && PICK+=("${t%%$'\t'*}"); done
+    [ ${#PICK[@]} -gt 0 ] || { echo "Cancelled"; exit 0; }
+    if [ "$1" = save ] || [ "$key" = ctrl-s ]; then
+        { printf '%s\n' "${PICK[@]}" > "$SEL.tmp" && mv -f "$SEL.tmp" "$SEL"; } || { rm -f "$SEL.tmp"; echo "backup: couldn't write $SEL" >&2; exit 1; }
+        echo "Saved as the default: ${PICK[*]}"
+    fi
+}
+
+case ${1:-} in
+--pick)
+    picker save
+    exit ;;
+list)
+    need_dest
+    if [ -n "$REMOTE" ]; then
+        echo "In $DEST:"
+        # shellcheck disable=SC2029  # (the folder's name goes over already quoted)
+        ssh "$REMOTE" "cd $(printf %q "$RDIR") 2>/dev/null && find . -mindepth 1 -maxdepth 1 -exec du -sh {} +" |
+            sed 's|\./||' | sort -k2 | grep . || echo "Nothing there yet"
+        exit
+    fi
+    shopt -s nullglob; B=("$DEST"/backup-*.tar.zst.age); shopt -u nullglob
+    [ ${#B[@]} -gt 0 ] || { echo "No backups in $DEST"; exit 0; }
+    cd "$DEST" && ls -1tr -- "${B[@]##*/}" | tr '\n' '\0' | xargs -0 stat -c '%s  %n' -- | numfmt --to=iec --suffix=B --padding=7
+    exit ;;
+restore)
+    FILE=${2:-}
+    # from another computer's folder: all of it, or the one thing named (backup restore Library), into a new folder
+    if [ -n "$REMOTE" ]; then
+        need_dest
+        printf -v d '%(%Y-%m-%d_%H%M)T' -1
+        DIR=$(realpath -m -- "${3:-$HOME/restore-$d}")
+        case $DIR in /|"$(realpath -- "$HOME")") echo "backup: won't restore over $DIR" >&2; exit 1 ;; esac
+        mkdir -p -- "$DIR" || exit 1
+        echo "Copying $DEST/${FILE} into $DIR"
+        rsync -a -h --info=progress2 -- "$REMOTE:$RDIR/${FILE%/}" "$DIR/" && { echo "Done: $DIR"; exit 0; }
+        rmdir -- "$DIR" 2>/dev/null
+        echo "backup: restore failed" >&2
+        exit 1
+    fi
+    if [ -z "$FILE" ]; then
+        need_dest
+        backups
+        if [ ${#B[@]} -eq 0 ]; then
+            # none from this computer: after a reinstall its name ($HOST) changes, so take the newest from any
+            P=()
+            shopt -s nullglob; any=("$DEST"/backup-*.tar.zst.age); shopt -u nullglob
+            for f in "${any[@]}"; do if [[ $f == *-partial.tar.zst.age ]]; then P+=("$f"); else B+=("$f"); fi; done
+            [ ${#B[@]} -gt 0 ] && mapfile -t B < <(by_time "${B[@]}")
+            [ ${#B[@]} -gt 0 ] && echo "No full backup from this computer ($HOST), so using the newest one: ${B[-1]##*/}"
+        fi
+        # a one-off backup only has some folders, so it's never picked for you
+        if [ ${#B[@]} -gt 0 ]; then FILE=${B[-1]}
+        elif [ ${#P[@]} -gt 0 ]; then
+            mapfile -t P < <(by_time "${P[@]}")
+            echo "backup: there's no full backup, only one-offs of some folders. To restore the newest of those: backup restore ${P[-1]}" >&2
+            exit 1
+        fi
+    fi
+    # a name as backup list shows it is looked for in the backup folder
+    [ -f "$FILE" ] || [ ! -f "$DEST/$FILE" ] || FILE=$DEST/$FILE
+    [ -f "$FILE" ] || { echo "backup: no backup to restore${FILE:+ ($FILE)}" >&2; exit 1; }
+    d=${FILE##*/}; d=${d#backup-}; d=${d%.tar.zst.age}; [[ $d == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9][0-9][0-9] ]] || d=${d#*_}
+    DIR=$(realpath -m -- "${3:-$HOME/restore-$d}")
+    case $DIR in
+        /|"$(realpath -- "$HOME")") echo "backup: won't restore over $DIR" >&2; exit 1 ;;
+    esac
+    keys=()
+    for k in "$CFG/key.age" "$(dirname -- "$FILE")"/key*.age "$DEST"/key*.age; do
+        [ -f "$k" ] || continue
+        for o in "${keys[@]}"; do cmp -s -- "$o" "$k" && continue 2; done
+        keys+=("$k")
+    done
+    [ ${#keys[@]} -gt 0 ] || { echo "backup: no key.age in $CFG, next to the backup or in $DEST" >&2; exit 1; }
+    mkdir -p -- "$DIR" || exit 1
+    echo "Restoring ${FILE##*/} into $DIR"
+    for KEY in "${keys[@]}"; do
+        [ ${#keys[@]} -gt 1 ] && echo "Trying the key ${KEY/#$HOME/\~}"
+        if age -d -i "$KEY" -- "$FILE" | zstd -dq | tar -x -C "$DIR"; then echo "Done: $DIR"; exit 0; fi
+    done
+    rmdir -- "$DIR" 2>/dev/null
+    echo "backup: restore failed" >&2
+    exit 1 ;;
+"") need_dest "nothing backed up" ;;
+*) echo "Usage: backup | backup --pick | backup list | backup restore [FILE] [DIR]" >&2; exit 1 ;;
+esac
+
+# (the encryption key: only for backups to a drive)
+if [ -z "$REMOTE" ] && [ ! -s "$CFG/recipient" ] && [ -f "$DEST/key.age" ]; then
+    [[ $(tty) == /dev/pts/* ]] || { say "run backup once in a terminal first, to unlock the backup key on the drive"; exit 1; }
+    echo "This drive already has a backup key. Enter its passphrase to use it here too."
+    pub=$(age -d -- "$DEST/key.age" | age-keygen -y 2>/dev/null) || { say "couldn't unlock $DEST/key.age"; exit 1; }
+    cp -f "$DEST/key.age" "$CFG/key.age" && echo "$pub" > "$CFG/recipient"
+fi
+if [ -z "$REMOTE" ] && [ ! -s "$CFG/recipient" ]; then
+    [[ $(tty) == /dev/pts/* ]] || { say "run backup once in a terminal first, to set the key's passphrase"; exit 1; }
+    echo "First backup: making the backup key. Choose a passphrase: you'll need it (and only it) to restore."
+    key=$(age-keygen 2>/dev/null) || exit 1
+    pub=${key#*public key: } pub=${pub%%$'\n'*}
+    printf '%s\n' "$key" | age -p -o "$CFG/key.age.tmp" || { rm -f "$CFG/key.age.tmp"; exit 1; }
+    unset key
+    mv -f "$CFG/key.age.tmp" "$CFG/key.age"
+    echo "$pub" > "$CFG/recipient"
+fi
+if [ -z "$REMOTE" ] && [ -f "$CFG/key.age" ]; then
+    if [ ! -f "$DEST/key.age" ]; then cp "$CFG/key.age" "$DEST/key.age"
+    elif ! cmp -s "$CFG/key.age" "$DEST/key.age"; then
+        k=$DEST/key-$(cut -c5-16 "$CFG/recipient").age
+        [ -f "$k" ] || cp "$CFG/key.age" "$k"
+    fi
+fi
+
+PART=
+if [[ $(tty) == /dev/pts/* ]] && [ -t 1 ] && command -v fzf >/dev/null; then
+    picker
+    # anything but your usual folders is a one-off: kept apart from the full backups, and never restored unless you name it
+    picked=("${PICK[@]}")
+    defaults
+    [ "$(printf '%s\n' "${picked[@]}" | LC_ALL=C sort -u)" = "$(printf '%s\n' "${PICK[@]}" | LC_ALL=C sort -u)" ] || PART=-partial
+    PICK=("${picked[@]}")
+else
+    defaults
+fi
+
+H=${HOME#/}
+ROOTS=() all=0
+for t in "${PICK[@]}"; do [ "$t" = '~' ] && all=1; done
+for t in "${PICK[@]}"; do
+    a=$(realpath -ms -- "${t/#\~/$HOME}"); a=${a#/}
+    [ -n "$a" ] || continue
+    if [ "$all" = 1 ] && [[ $a == "$H"/* ]]; then
+        in=0
+        for s in "${SKIP[@]}"; do [[ $a == "$H/$s" || $a == "$H/$s"/* ]] && in=1; done
+        [ "$in" = 1 ] || continue
+    fi
+    [ -e "/$a" ] || [ -L "/$a" ] || { echo "backup: $t isn't there, so it's left out" >&2; continue; }
+    ROOTS+=("$a")
+done
+[ ${#ROOTS[@]} -gt 0 ] || { say "nothing to back up: none of the chosen folders exist (backup --pick)"; exit 1; }
+
+printf -v NOW '%(%Y-%m-%d_%H%M)T' -1
+OUT=$DEST/backup-${HOST}_$NOW$PART.tar.zst.age
+TMP=$DEST/.backup-$NOW.$$.part
+trap 'rm -f "$TMP"' EXIT
+
+mapfile -d '' extra < <("$HOME/.local/bin/kp" --files 2>/dev/null)
+
+list_files() {
+    cd / || exit 1
+    local p r s d=${DEST#/}
+    [ -n "$REMOTE" ] && d=
+    for r in "${ROOTS[@]}"; do
+        p=()
+        for s in "${SKIP[@]}"; do [[ $r == "$H/$s" || $r == "$H/$s"/* ]] || p+=(-path "$H/$s" -o); done
+        p+=(-path "$H/.var/app/*/cache" -o -name node_modules)
+        [ -n "$d" ] && p+=(-o -path "$d")
+        find "$r" \( "${p[@]}" \) -prune -o \( -type f \( -name '*.iso' -o -name '*.qcow2' \) \) -o \
+            \( -type f -o -type d -o -type l \) -print0
+    done
+    for s in "${SKIP[@]}"; do
+        [ -d "$H/$s" ] && find "$H/$s" -type f \( -name '*.kdbx' -o -name '*.keyx' \) -print0
+    done
+    for s in "${extra[@]}"; do printf '%s\0' "${s#/}"; done
+}
+
+# to another computer: the files themselves, under the same names as in your home folder (~/Library → FOLDER/Library)
+if [ -n "$REMOTE" ]; then
+    echo "Copying to $REMOTE:$RDIR (new and changed files; nothing there is deleted)"
+    list_files 2>/dev/null | LC_ALL=C sort -zu | while IFS= read -r -d '' p; do
+        if [[ $p == "$H"/* ]]; then printf '%s\0' "${p#"$H"/}"
+        elif [ "$p" != "$H" ]; then echo "backup: /$p is outside your home folder, so it's left out" >&2; fi
+    done | rsync -a -h --partial --mkpath --from0 --files-from=- --info=progress2 -- "$HOME/" "$REMOTE:$RDIR/"
+    r=${PIPESTATUS[2]}
+    # (24: a file went away while it was copied, a cache say: the rest is there)
+    if [ "$r" != 0 ] && [ "$r" != 24 ]; then say "copying to $DEST didn't finish (rsync $r): run backup again to carry on"; exit 1; fi
+    notify-send --app-name=backup "Backup" "Copied to $DEST" 2>/dev/null
+    echo "Done: in $DEST"
+    exit 0
+fi
+
+echo "Backing up to $OUT"
+[ -n "$PART" ] && echo "(not your usual folders, so it's a one-off: the newest $PARTS of those are kept, apart from the full backups)"
+list_files 2>/dev/null | LC_ALL=C sort -zu |
+    tar -C / --null --no-recursion --ignore-failed-read -T - -cf - |
+    zstd -T0 -q | age -R "$CFG/recipient" > "$TMP"
+st=("${PIPESTATUS[@]}")
+if [ "${st[2]}" -gt 1 ] || [ "${st[3]}" -ne 0 ] || [ "${st[4]}" -ne 0 ]; then
+    say "backup failed (tar ${st[2]}, zstd ${st[3]}, age ${st[4]})"
+    exit 1
+fi
+mv -f "$TMP" "$OUT" || exit 1
+trap - EXIT
+
+backups
+prune
+echo "Done: ${OUT##*/} ($(numfmt --to=iec --suffix=B "$(stat -c %s "$OUT")"))"

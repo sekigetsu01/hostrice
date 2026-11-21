@@ -1,0 +1,17 @@
+#!/bin/bash
+# vm NAME: the VM's window (virt-manager). Pressed again while that window is open and the VM is off (or paused),
+# it powers the VM on too; the first press only opens the window, as before
+c=qemu:///system
+name=${1:?usage: vm NAME}
+
+# its window open already ("NAME on QEMU/KVM")?
+if mmsg get all-clients 2>/dev/null | python3 -I -c 'import json, sys
+sys.exit(0 if any(c.get("appid") == "virt-manager" and c.get("title") == sys.argv[1] + " on QEMU/KVM"
+                  for c in json.load(sys.stdin).get("clients", [])) else 1)' "$name"; then
+    case $(virsh -c "$c" domstate "$name" 2>/dev/null) in
+        "shut off" | crashed) out=$(virsh -c "$c" start "$name" 2>&1) ;;
+        paused) out=$(virsh -c "$c" resume "$name" 2>&1) ;;
+        *) true ;;
+    esac || notify-send -a "Virtual machines" "Couldn't start $name" "$out"
+fi
+exec virt-manager --connect "$c" --show-domain-console "$name"

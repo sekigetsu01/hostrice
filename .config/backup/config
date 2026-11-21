@@ -1,0 +1,2 @@
+BACKUP_DEST=/mnt/hdd/backup
+BACKUP_DEST_VM=host:~/backups

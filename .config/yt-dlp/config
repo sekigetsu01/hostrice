@@ -1,0 +1,4 @@
+# Name downloads after the title only (yt-dlp adds " [video ID]" by default)
+-o %(title)s.%(ext)s
+# Fetch YouTube's challenge solver if the installed one is too old
+--remote-components ejs:github

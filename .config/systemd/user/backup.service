@@ -1,0 +1,9 @@
+[Unit]
+Description=Encrypted backup of the home folder
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/backup
+SuccessExitStatus=75
+Nice=10
+IOSchedulingClass=idle

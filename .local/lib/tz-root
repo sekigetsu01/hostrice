@@ -1,0 +1,9 @@
+#!/bin/sh
+# Sets the system time zone: the one thing the time zone picker (Super+F3) runs as root, through
+# /etc/sudoers.d/timezone, so it never asks for a password. Only a real zone from /usr/share/zoneinfo.
+PATH=/usr/bin
+z=${1:-}
+case $z in '' | /* | *..* | posix/* | right/* | *[!A-Za-z0-9_+/-]*) z= ;; esac
+[ $# = 1 ] && [ -n "$z" ] && [ -f "/usr/share/zoneinfo/$z" ] || { echo "not a time zone: ${1:-}" >&2; exit 2; }
+# timedatectl tells running programs; the plain link is for when timedated can't be reached
+timedatectl set-timezone "$z" 2>/dev/null || ln -sf "/usr/share/zoneinfo/$z" /etc/localtime
