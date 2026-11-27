@@ -1,0 +1,13 @@
+#!/bin/sh
+# sioyek's o: pick a book with yazi (from ~/Library) and open it in this sioyek window
+f=$(mktemp) || exit 1
+trap 'rm -f "$f"' EXIT
+dir=$HOME/Library
+[ -d "$dir" ] || dir=$HOME
+YAZI_PICKER=1 kitty yazi --chooser-file="$f" "$dir"
+IFS= read -r pick < "$f" || [ -n "$pick" ] || exit 0
+case $1 in
+    '' | *[!0-9]*) set -- ;;
+    *) set -- --window-id "$1" ;;
+esac
+sioyek "$@" "$pick"

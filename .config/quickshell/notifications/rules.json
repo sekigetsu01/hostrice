@@ -1,0 +1,3 @@
+{
+    "_help": "Per-app rules for notifications, by the app name shown on the pop-up. quiet: notification center only, no pop-up, e.g. \"Some App\": { \"quiet\": true }. Saved changes apply straight away."
+}
